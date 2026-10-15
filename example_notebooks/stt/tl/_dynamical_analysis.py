@@ -3,12 +3,18 @@ import pandas as pd
 import anndata
 import scanpy as sc
 import cellrank as cr
-from cellrank.tl.estimators import GPCCA
-from cellrank.tl.kernels import ConnectivityKernel
+import inspect
+try:
+    from cellrank.tl.estimators import GPCCA
+    from cellrank.tl.kernels import ConnectivityKernel, VelocityKernel
+except ModuleNotFoundError:
+    # CellRank 2 moved the public API from ``cellrank.tl`` to these modules.
+    from cellrank.estimators import GPCCA
+    from cellrank.kernels import ConnectivityKernel, VelocityKernel
 from sklearn.model_selection import train_test_split
 
 
-def dynamical_analysis(sc_object,sc_object_aggr, n_states = None, n_states_seq = None, weight_connectivities=0.2, n_components=20, thresh_ms_gene = 0, use_spatial = False, spa_weight = 0.5, spa_conn_key = 'spatial'):
+def dynamical_analysis(sc_object,sc_object_aggr, n_states = None, n_states_seq = None, weight_connectivities=0.2, n_components=20, thresh_ms_gene = 0, use_spatial = False, spa_weight = 0.5, spa_conn_key = 'spatial', n_jobs=-1):
     """
     Perform STT dynamical analysis on a single-cell transcriptomics dataset.
 
@@ -40,14 +46,31 @@ def dynamical_analysis(sc_object,sc_object_aggr, n_states = None, n_states_seq =
     None, but the results are stored in the AnnData object including the transition matrix, the stationary distribution, the macrostates memberships, the selected genes, and the kernel.
     """
     gene_select = sc_object.var['r2_test'][sc_object.var['r2_test']>thresh_ms_gene].index.tolist()
+    if not gene_select:
+        raise ValueError(
+            f"STT selected no velocity genes: no r2_test values exceed "
+            f"thresh_ms_gene={thresh_ms_gene} among {sc_object.n_vars} genes "
+            f"(max r2_test={sc_object.var['r2_test'].max()})."
+        )
     gene_subset = [gene+'_u' for gene in gene_select]+gene_select
     r2_keep_test = sc_object.var['r2_test'][sc_object.var['r2_test']>thresh_ms_gene]
     r2_keep_train = sc_object.var['r2_train'][sc_object.var['r2_test']>thresh_ms_gene]   
 
 
     #kernel_tensor = cr.tl.transition_matrix(sc_object_aggr, weight_connectivities=0,  n_jobs=-1,scheme = 'dot_product',gene_subset = gene_subset)
-    kernel_tensor = cr.tl.kernels.VelocityKernel(sc_object_aggr, gene_subset = gene_subset)
-    kernel_tensor.compute_transition_matrix(n_jobs=-1,show_progress_bar = False,scheme = 'dot_product')
+    kernel_tensor = VelocityKernel(
+        sc_object_aggr,
+        xkey='spliced',
+        gene_subset=gene_subset,
+    )
+    # CellRank 2 renamed ``scheme`` to ``similarity``. Keep using the same
+    # dot-product transition rule with either supported API.
+    transition_kwargs = {'n_jobs': n_jobs, 'show_progress_bar': False}
+    transition_arg = 'scheme' if 'scheme' in inspect.signature(
+        kernel_tensor.compute_transition_matrix
+    ).parameters else 'similarity'
+    transition_kwargs[transition_arg] = 'dot_product'
+    kernel_tensor.compute_transition_matrix(**transition_kwargs)
 
     kernel = (1-weight_connectivities)*kernel_tensor+weight_connectivities*sc_object.uns['kernel_connectivities']
     if use_spatial:
@@ -205,7 +228,7 @@ def aver_velo(tensor_v,membership):
     
     return velo
 
-def dynamical_iteration(adata, n_states=None, n_states_seq=None, n_iter=10, return_aggr_obj=True, weight_connectivities=0.2, n_components=20, n_neighbors=100, thresh_ms_gene=0, thresh_entropy=0.1, use_spatial=False, spa_weight=0.5, spa_conn_key='spatial', monitor_mode=False, l2=0.1):
+def dynamical_iteration(adata, n_states=None, n_states_seq=None, n_iter=10, return_aggr_obj=True, weight_connectivities=0.2, n_components=20, n_neighbors=100, thresh_ms_gene=0, thresh_entropy=0.1, use_spatial=False, spa_weight=0.5, spa_conn_key='spatial', monitor_mode=False, l2=0.1, n_jobs=-1):
     """
     Perform dynamical iteration on the given AnnData object. The function updates the attractor states, the tensor, the averaged velocity, and the entropy at each iteration.
 
@@ -302,7 +325,7 @@ def dynamical_iteration(adata, n_states=None, n_states_seq=None, n_iter=10, retu
         
         sc.tl.pca(sc_object_aggr,use_highly_variable = True)
         sc.pp.neighbors(sc_object_aggr,n_neighbors = n_neighbors)#update the neighbors using multistable genes
-        dynamical_analysis(adata, sc_object_aggr, n_states = n_states,n_states_seq=n_states_seq, weight_connectivities=weight_connectivities, n_components = n_components,thresh_ms_gene = thresh_ms_gene, use_spatial = use_spatial, spa_weight = spa_weight, spa_conn_key = spa_conn_key)
+        dynamical_analysis(adata, sc_object_aggr, n_states = n_states,n_states_seq=n_states_seq, weight_connectivities=weight_connectivities, n_components = n_components,thresh_ms_gene = thresh_ms_gene, use_spatial = use_spatial, spa_weight = spa_weight, spa_conn_key = spa_conn_key, n_jobs=n_jobs)
         
         rho = adata.obsm['rho']
         adata.obs['attractor'] =  np.argmax(rho,axis = 1)
@@ -374,4 +397,4 @@ def dynamical_iteration(adata, n_states=None, n_states_seq=None, n_iter=10, retu
         sc_object_aggr.obs['speed'] = adata.obs['speed'].values
         sc_object_aggr.obs['attractor'] = adata.obs['attractor'].values
         return sc_object_aggr
-    
+
